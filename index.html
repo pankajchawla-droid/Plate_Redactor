@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <title>Plate Redactor</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <style>
   :root{
     --ink:#1a1d1a;
@@ -136,7 +138,7 @@
   <header>
     <p class="eyebrow">Privacy tool</p>
     <h1>Plate Redactor</h1>
-    <p class="sub">Upload one or more vehicle photos. Plates are auto-detected with a lightweight heuristic and boxed for you — drag to fine-tune, then blur or black out and download, one at a time or all together as a ZIP. Everything runs locally in your browser; nothing is uploaded anywhere.</p>
+    <p class="sub">Upload one or more vehicle photos. A vehicle-detection model finds the car first, then the plate is located within it automatically — no clicking required. Fine-tune or manually redirect it if needed, then blur or black out and download. Everything runs locally in your browser; nothing is uploaded anywhere.</p>
   </header>
 
   <div class="panel" id="uploadPanel">
@@ -169,7 +171,7 @@
       <canvas id="canvas"></canvas>
     </div>
 
-    <p class="hint">Auto-detect scans the whole photo and can miss on angled shots or busy backgrounds. If the box lands in the wrong place, click <strong>🎯 Click on plate</strong> then tap directly on the plate in the image — it'll search just that area, which is far more reliable. Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it.</p>
+    <p class="hint">Detection runs a vehicle-locator model first, then searches within the vehicle for the plate — this is far more reliable than scanning the whole photo blind. If it still lands wrong (unusual angle, multiple vehicles, cluttered background), click <strong>🎯 Click on plate</strong> and tap the plate directly. Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it.</p>
 
     <div class="toolbar" style="margin-top:14px; margin-bottom:0;">
       <button id="addMoreBtn" class="ghost">+ Add more images</button>
@@ -212,17 +214,73 @@
   let idCounter = 0;
   let pickMode = false;
 
+  let vehicleModel = null;
+  let vehicleModelPromise = null;
+  let vehicleModelFailed = false;
+
+  function getVehicleModel(){
+    if(vehicleModel) return Promise.resolve(vehicleModel);
+    if(vehicleModelFailed) return Promise.resolve(null);
+    if(!vehicleModelPromise){
+      vehicleModelPromise = (typeof cocoSsd !== 'undefined' ? cocoSsd.load() : Promise.reject(new Error('unavailable')))
+        .then(m => { vehicleModel = m; return m; })
+        .catch(err => { vehicleModelFailed = true; console.warn('Vehicle model unavailable, falling back to heuristic-only detection.', err); return null; });
+    }
+    return vehicleModelPromise;
+  }
+
+  const VEHICLE_CLASSES = ['car','truck','bus','motorcycle'];
+
+  async function detectVehicleBox(image, naturalW, naturalH){
+    const model = await getVehicleModel();
+    if(!model) return null;
+    try{
+      const predictions = await model.detect(image);
+      const vehicles = predictions.filter(p => VEHICLE_CLASSES.includes(p.class) && p.score > 0.4);
+      if(!vehicles.length) return null;
+      vehicles.sort((a,b) => (b.bbox[2]*b.bbox[3]) - (a.bbox[2]*a.bbox[3]));
+      const [x,y,w,h] = vehicles[0].bbox;
+      return {
+        xPct: clamp(x / naturalW, 0, 1),
+        yPct: clamp(y / naturalH, 0, 1),
+        wPct: clamp(w / naturalW, 0, 1),
+        hPct: clamp(h / naturalH, 0, 1)
+      };
+    } catch(err){
+      console.warn('Vehicle detection failed for this image.', err);
+      return null;
+    }
+  }
+
+  async function detectPlateForImage(image, naturalW, naturalH){
+    const vehicleBox = await detectVehicleBox(image, naturalW, naturalH);
+    if(vehicleBox){
+      const region = {
+        xPct: vehicleBox.xPct,
+        yPct: vehicleBox.yPct + vehicleBox.hPct * 0.25,
+        wPct: vehicleBox.wPct,
+        hPct: vehicleBox.hPct * 0.75
+      };
+      const det = autoDetectPlate(image, naturalW, naturalH, { region });
+      if(det.found) return { box: det.box, method: 'vehicle' };
+      return { box: det.box, method: 'vehicle-weak' };
+    }
+    const det = autoDetectPlate(image, naturalW, naturalH);
+    return { box: det.box, method: det.found ? 'heuristic' : 'none' };
+  }
+
   function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 
   function handleFiles(fileList){
     const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
     if(!files.length) return;
     let pending = files.length;
+    statusEl.textContent = 'Loading detection model…';
     files.forEach(file => {
       const reader = new FileReader();
       reader.onload = (e) => {
         const image = new Image();
-        image.onload = () => {
+        image.onload = async () => {
           const entry = {
             id: 'img' + (idCounter++),
             name: file.name,
@@ -230,19 +288,25 @@
             naturalW: image.naturalWidth,
             naturalH: image.naturalHeight,
             boxes: [],
-            detected: false
+            detected: false,
+            method: 'none'
           };
-          const det = autoDetectPlate(image, entry.naturalW, entry.naturalH);
-          entry.boxes.push(det.box);
-          entry.detected = det.found;
           images.push(entry);
           if(currentIndex === -1) currentIndex = 0;
           renderThumbs();
           if(images.length === 1){ selectImage(0); }
           uploadPanel.style.display = 'none';
           editPanel.style.display = 'block';
+
+          const result = await detectPlateForImage(image, entry.naturalW, entry.naturalH);
+          entry.boxes.push(result.box);
+          entry.detected = result.method === 'vehicle';
+          entry.method = result.method;
+          renderThumbs();
+          if(images[currentIndex] === entry) renderBoxes();
+
           pending--;
-          if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images loaded') : 'Image loaded';
+          if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images processed') : 'Image processed';
         };
         image.src = e.target.result;
       };
@@ -267,8 +331,10 @@
       im.src = entry.img.src;
       t.appendChild(im);
       const badge = document.createElement('div');
-      badge.className = 'badge' + (entry.detected ? '' : ' none');
-      badge.textContent = entry.detected ? 'auto' : 'manual';
+      const badgeText = { vehicle: 'auto', 'vehicle-weak': 'auto*', heuristic: 'auto*', none: 'manual' }[entry.method] || 'manual';
+      const badgeGood = entry.method === 'vehicle';
+      badge.className = 'badge' + (badgeGood ? '' : ' none');
+      badge.textContent = badgeText;
       t.appendChild(badge);
       const rm = document.createElement('div');
       rm.className = 'remove';
@@ -372,15 +438,19 @@
     renderBoxes();
   });
 
-  autoBtn.addEventListener('click', () => {
+  autoBtn.addEventListener('click', async () => {
     if(currentIndex === -1) return;
     const entry = images[currentIndex];
-    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH);
-    entry.boxes = [det.box];
-    entry.detected = det.found;
+    statusEl.textContent = 'Re-detecting…';
+    const result = await detectPlateForImage(entry.img, entry.naturalW, entry.naturalH);
+    entry.boxes = [result.box];
+    entry.detected = result.method === 'vehicle';
+    entry.method = result.method;
     renderBoxes();
     renderThumbs();
-    statusEl.textContent = det.found ? 'Auto-detected a likely plate region' : 'No confident match - placed a default box, please adjust';
+    statusEl.textContent = result.method === 'vehicle' ? 'Detected via vehicle + plate model'
+      : result.method === 'heuristic' ? 'No vehicle found — used a whole-image best guess'
+      : 'Low confidence — please adjust or use Click on plate';
   });
 
   pickBtn.addEventListener('click', () => {
@@ -399,9 +469,10 @@
     const yPct = (e.clientY - rect.top) / rect.height;
 
     const entry = images[currentIndex];
-    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH, {xPct, yPct});
+    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH, {focus: {xPct, yPct}});
     entry.boxes.push(det.box);
     entry.detected = true;
+    entry.method = 'click';
     renderBoxes();
     renderThumbs();
 
@@ -501,7 +572,11 @@
     }
   });
 
-  function autoDetectPlate(image, naturalW, naturalH, focus){
+  function autoDetectPlate(image, naturalW, naturalH, opts){
+    opts = opts || {};
+    const focus = opts.focus || null;
+    const region = opts.region || null;
+
     const maxDim = 380;
     const scale = Math.min(1, maxDim / Math.max(naturalW, naturalH));
     const w = Math.max(20, Math.round(naturalW * scale));
@@ -570,6 +645,18 @@
       focusRadius = 0.28 * Math.max(w, h);
     }
 
+    // When given a vehicle bounding box, constrain the search to inside it —
+    // this narrows the search space enormously vs. scanning the whole photo.
+    let regionBounds = null;
+    if(region){
+      regionBounds = {
+        x0: region.xPct * w,
+        y0: region.yPct * h,
+        x1: (region.xPct + region.wPct) * w,
+        y1: (region.yPct + region.hPct) * h
+      };
+    }
+
     let best = null;
 
     aspects.forEach(aspect => {
@@ -585,6 +672,9 @@
             if(focus){
               const dist = Math.hypot(cx - focusX, cy - focusY);
               if(dist > focusRadius) continue;
+            }
+            if(regionBounds){
+              if(cx < regionBounds.x0 || cx > regionBounds.x1 || cy < regionBounds.y0 || cy > regionBounds.y1) continue;
             }
 
             const area = bw*bh;
@@ -604,6 +694,11 @@
               const dist = Math.hypot(cx - focusX, cy - focusY);
               const proximity = 1 - clamp(dist / focusRadius, 0, 1);
               score = density * contrastScore * (0.4 + 0.6 * proximity);
+            } else if(regionBounds){
+              // mild preference for the lower half of the vehicle box (bumper area)
+              const relY = (cy - regionBounds.y0) / Math.max(1, regionBounds.y1 - regionBounds.y0);
+              const lowerPref = 0.6 + 0.4 * clamp(relY, 0, 1);
+              score = density * contrastScore * lowerPref;
             } else {
               const yc = cy / h;
               const posPrior = yc > 0.35 ? 1 : clamp(yc/0.35, 0.15, 1) * 0.6;
@@ -629,6 +724,20 @@
         x: clamp(Math.round(focusX - bw/2), 0, w - bw),
         y: clamp(Math.round(focusY - bh/2), 0, h - bh),
         w: bw, h: bh, score: 1
+      };
+    }
+
+    if(regionBounds && (!best || best.score < 0.015)){
+      const rw = regionBounds.x1 - regionBounds.x0;
+      const rh = regionBounds.y1 - regionBounds.y0;
+      const bw = Math.round(rw * 0.42);
+      const bh = Math.round(bw / 3.2);
+      const cx = regionBounds.x0 + rw/2;
+      const cy = regionBounds.y0 + rh * 0.7;
+      best = {
+        x: clamp(Math.round(cx - bw/2), 0, w - bw),
+        y: clamp(Math.round(cy - bh/2), 0, h - bh),
+        w: bw, h: bh, score: 0.01
       };
     }
 
