@@ -109,6 +109,8 @@
     display:none; user-select:none; touch-action:none;
   }
   .stage.show{display:block;}
+  .stage.pick-mode{cursor:crosshair;}
+  .stage.pick-mode .box{pointer-events:none;}
   .stage canvas{display:block; width:100%; height:auto;}
   .box{
     position:absolute; border:2px solid #ff5a3c; background:rgba(255,90,60,0.12);
@@ -158,6 +160,7 @@
         <input type="range" id="strength" min="4" max="40" value="18">
       </label>
       <button id="autoBtn">Re-run auto-detect</button>
+      <button id="pickBtn">🎯 Click on plate</button>
       <button id="addBoxBtn">+ Add box</button>
       <span class="status" id="status"></span>
     </div>
@@ -166,7 +169,7 @@
       <canvas id="canvas"></canvas>
     </div>
 
-    <p class="hint">Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it (when more than one exists). Auto-detect is a heuristic, not a trained model — it works best on clear, mostly front-on shots, and may need a manual nudge on angled or blurry ones.</p>
+    <p class="hint">Auto-detect scans the whole photo and can miss on angled shots or busy backgrounds. If the box lands in the wrong place, click <strong>🎯 Click on plate</strong> then tap directly on the plate in the image — it'll search just that area, which is far more reliable. Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it.</p>
 
     <div class="toolbar" style="margin-top:14px; margin-bottom:0;">
       <button id="addMoreBtn" class="ghost">+ Add more images</button>
@@ -195,6 +198,7 @@
   const modeBlockBtn = document.getElementById('modeBlock');
   const addBoxBtn = document.getElementById('addBoxBtn');
   const autoBtn = document.getElementById('autoBtn');
+  const pickBtn = document.getElementById('pickBtn');
   const applyBtn = document.getElementById('applyBtn');
   const applyAllBtn = document.getElementById('applyAllBtn');
   const resetBtn = document.getElementById('resetBtn');
@@ -206,6 +210,7 @@
   let currentIndex = -1;
   let boxEls = [];
   let idCounter = 0;
+  let pickMode = false;
 
   function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 
@@ -378,6 +383,34 @@
     statusEl.textContent = det.found ? 'Auto-detected a likely plate region' : 'No confident match - placed a default box, please adjust';
   });
 
+  pickBtn.addEventListener('click', () => {
+    if(currentIndex === -1) return;
+    pickMode = !pickMode;
+    pickBtn.classList.toggle('primary', pickMode);
+    stage.classList.toggle('pick-mode', pickMode);
+    statusEl.textContent = pickMode ? 'Tap directly on the plate in the image...' : '';
+  });
+
+  stage.addEventListener('click', (e) => {
+    if(!pickMode || currentIndex === -1) return;
+    if(e.target.closest('.box')) return;
+    const rect = stage.getBoundingClientRect();
+    const xPct = (e.clientX - rect.left) / rect.width;
+    const yPct = (e.clientY - rect.top) / rect.height;
+
+    const entry = images[currentIndex];
+    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH, {xPct, yPct});
+    entry.boxes.push(det.box);
+    entry.detected = true;
+    renderBoxes();
+    renderThumbs();
+
+    pickMode = false;
+    pickBtn.classList.remove('primary');
+    stage.classList.remove('pick-mode');
+    statusEl.textContent = 'Box placed near where you clicked — drag to fine-tune if needed';
+  });
+
   modeBlurBtn.addEventListener('click', () => {
     mode = 'blur'; modeBlurBtn.classList.add('active'); modeBlockBtn.classList.remove('active');
     document.getElementById('strengthField').style.display = 'flex';
@@ -468,7 +501,7 @@
     }
   });
 
-  function autoDetectPlate(image, naturalW, naturalH){
+  function autoDetectPlate(image, naturalW, naturalH, focus){
     const maxDim = 380;
     const scale = Math.min(1, maxDim / Math.max(naturalW, naturalH));
     const w = Math.max(20, Math.round(naturalW * scale));
@@ -527,6 +560,16 @@
     const aspects = [2.2, 2.6, 3.0, 3.6, 4.2, 5.0];
     const wFracs = [0.15, 0.22, 0.30, 0.40, 0.50];
 
+    // When the user clicked a specific spot, constrain the search to a
+    // neighborhood around it and score by proximity instead of guessing
+    // position from scratch — this is much more reliable than a blind scan.
+    let focusX = null, focusY = null, focusRadius = null;
+    if(focus){
+      focusX = focus.xPct * w;
+      focusY = focus.yPct * h;
+      focusRadius = 0.28 * Math.max(w, h);
+    }
+
     let best = null;
 
     aspects.forEach(aspect => {
@@ -534,9 +577,16 @@
         const bw = Math.round(wFrac * w);
         const bh = Math.round(bw / aspect);
         if(bh < 6 || bw >= w || bh >= h) return;
-        const stride = Math.max(4, Math.round(bw * 0.25));
+        const stride = Math.max(3, Math.round(bw * 0.15));
         for(let y=0; y+bh<=h; y+=stride){
           for(let x=0; x+bw<=w; x+=stride){
+            const cx = x + bw/2, cy = y + bh/2;
+
+            if(focus){
+              const dist = Math.hypot(cx - focusX, cy - focusY);
+              if(dist > focusRadius) continue;
+            }
+
             const area = bw*bh;
             const eSum = boxSum(edgeInt, x, y, bw, bh);
             const density = eSum / area;
@@ -549,13 +599,18 @@
             const std = Math.sqrt(variance);
             const contrastScore = clamp(std / 55, 0, 1);
 
-            const yc = (y + bh/2) / h;
-            const posPrior = yc > 0.35 ? 1 : clamp(yc/0.35, 0.15, 1) * 0.6;
-
-            const xc = (x + bw/2) / w;
-            const xPrior = 1 - Math.abs(xc - 0.5) * 0.4;
-
-            const score = density * contrastScore * posPrior * xPrior;
+            let score;
+            if(focus){
+              const dist = Math.hypot(cx - focusX, cy - focusY);
+              const proximity = 1 - clamp(dist / focusRadius, 0, 1);
+              score = density * contrastScore * (0.4 + 0.6 * proximity);
+            } else {
+              const yc = cy / h;
+              const posPrior = yc > 0.35 ? 1 : clamp(yc/0.35, 0.15, 1) * 0.6;
+              const xc = cx / w;
+              const xPrior = 1 - Math.abs(xc - 0.5) * 0.4;
+              score = density * contrastScore * posPrior * xPrior;
+            }
 
             if(!best || score > best.score){
               best = {x, y, w: bw, h: bh, score};
@@ -564,6 +619,18 @@
         }
       });
     });
+
+    // If a click was given but nothing scored well, fall back to a
+    // reasonably sized box centered exactly on the click point.
+    if(focus && (!best || best.score < 0.015)){
+      const bw = Math.round(0.24 * w);
+      const bh = Math.round(bw / 3.0);
+      best = {
+        x: clamp(Math.round(focusX - bw/2), 0, w - bw),
+        y: clamp(Math.round(focusY - bh/2), 0, h - bh),
+        w: bw, h: bh, score: 1
+      };
+    }
 
     if(best && best.score > 0.02){
       return {
