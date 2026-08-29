@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Plate Redactor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root{
+    --ink:#1a1d1a;
+    --paper:#eef0ea;
+    --panel:#ffffff;
+    --line:#d6dacd;
+    --accent:#3a6b4c;
+    --accent-ink:#ffffff;
+    --muted:#6b7169;
+    --danger:#a4462f;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:28px 16px 60px;
+  }
+  .wrap{width:100%; max-width:920px;}
+  header{margin-bottom:22px;}
+  .eyebrow{
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); font-weight:700; margin:0 0 6px;
+  }
+  h1{margin:0 0 6px; font-size:28px; font-weight:800; letter-spacing:-0.01em;}
+  p.sub{margin:0; color:var(--muted); font-size:14.5px; line-height:1.5; max-width:64ch;}
+
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:18px;
+    margin-top:18px;
+  }
+
+  .dropzone{
+    border:2px dashed var(--line);
+    border-radius:8px;
+    padding:36px 20px;
+    text-align:center;
+    cursor:pointer;
+    transition:border-color .15s, background .15s;
+  }
+  .dropzone:hover, .dropzone.drag{ border-color:var(--accent); background:#f4f7f1; }
+  .dropzone strong{display:block; font-size:15px; margin-bottom:4px;}
+  .dropzone span{font-size:13px; color:var(--muted);}
+  input[type=file]{display:none;}
+
+  .toolbar{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:14px; }
+  button{
+    font:inherit; font-size:13.5px; font-weight:600;
+    border:1px solid var(--line); background:var(--panel); color:var(--ink);
+    padding:9px 14px; border-radius:7px; cursor:pointer;
+    transition:background .15s, border-color .15s, transform .05s;
+  }
+  button:hover{border-color:var(--accent);}
+  button:active{transform:translateY(1px);}
+  button.primary{ background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  button.primary:hover{filter:brightness(1.06);}
+  button.ghost{background:transparent;}
+  button:disabled{opacity:.45; cursor:not-allowed;}
+
+  .mode-group{ display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+  .mode-group button{ border:none; border-radius:0; background:var(--panel); }
+  .mode-group button.active{ background:var(--accent); color:var(--accent-ink); }
+  .mode-group button + button{border-left:1px solid var(--line);}
+
+  label.field{ display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  input[type=range]{accent-color:var(--accent);}
+
+  .thumbstrip{
+    display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; margin-bottom:14px;
+  }
+  .thumb{
+    position:relative; flex:0 0 auto; width:74px; height:56px;
+    border-radius:6px; overflow:hidden; border:2px solid var(--line);
+    cursor:pointer; background:#fff;
+  }
+  .thumb.active{border-color:var(--accent);}
+  .thumb img{width:100%; height:100%; object-fit:cover; display:block;}
+  .thumb .badge{
+    position:absolute; bottom:2px; right:2px;
+    background:rgba(58,107,76,0.92); color:#fff;
+    font-size:9px; font-weight:700; padding:1px 4px; border-radius:3px;
+  }
+  .thumb .badge.none{background:rgba(164,70,47,0.92);}
+  .thumb .remove{
+    position:absolute; top:2px; right:2px;
+    background:rgba(0,0,0,0.55); color:#fff;
+    width:16px; height:16px; border-radius:50%;
+    font-size:11px; line-height:16px; text-align:center;
+    cursor:pointer;
+  }
+
+  .stage{
+    position:relative; width:100%; border-radius:8px; overflow:hidden;
+    background:repeating-conic-gradient(#e4e7dd 0% 25%, #eef0ea 0% 50%) 50% / 20px 20px;
+    display:none; user-select:none; touch-action:none;
+  }
+  .stage.show{display:block;}
+  .stage canvas{display:block; width:100%; height:auto;}
+  .box{
+    position:absolute; border:2px solid #ff5a3c; background:rgba(255,90,60,0.12);
+    box-shadow:0 0 0 1px rgba(255,255,255,.6); cursor:move;
+  }
+  .box .handle{
+    position:absolute; width:14px; height:14px; background:#ff5a3c;
+    border:2px solid #fff; border-radius:50%; right:-8px; bottom:-8px; cursor:nwse-resize;
+  }
+  .box .tag{
+    position:absolute; top:-22px; left:-2px; background:#ff5a3c; color:#fff;
+    font-size:10.5px; font-weight:700; letter-spacing:.03em; padding:2px 6px;
+    border-radius:4px; white-space:nowrap;
+  }
+
+  .hint{ font-size:12.5px; color:var(--muted); margin-top:10px; line-height:1.5; }
+  .status{ font-size:12.5px; color:var(--accent); font-weight:600; margin-left:auto; }
+  footer{ margin-top:20px; font-size:12px; color:var(--muted); text-align:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Privacy tool</p>
+    <h1>Plate Redactor</h1>
+    <p class="sub">Upload one or more vehicle photos. Plates are auto-detected with a lightweight heuristic and boxed for you — drag to fine-tune, then blur or black out and download, one at a time or all together as a ZIP. Everything runs locally in your browser; nothing is uploaded anywhere.</p>
+  </header>
+
+  <div class="panel" id="uploadPanel">
+    <div class="dropzone" id="dropzone">
+      <strong>Click to choose images, or drop them here</strong>
+      <span>JPG or PNG · multiple files supported · works entirely offline in this tab</span>
+      <input type="file" id="fileInput" accept="image/*" multiple>
+    </div>
+  </div>
+
+  <div class="panel" id="editPanel" style="display:none;">
+    <div class="thumbstrip" id="thumbstrip"></div>
+
+    <div class="toolbar">
+      <div class="mode-group">
+        <button id="modeBlur" class="active">Blur</button>
+        <button id="modeBlock">Black box</button>
+      </div>
+      <label class="field" id="strengthField">
+        Strength
+        <input type="range" id="strength" min="4" max="40" value="18">
+      </label>
+      <button id="autoBtn">Re-run auto-detect</button>
+      <button id="addBoxBtn">+ Add box</button>
+      <span class="status" id="status"></span>
+    </div>
+
+    <div class="stage" id="stage">
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <p class="hint">Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it (when more than one exists). Auto-detect is a heuristic, not a trained model — it works best on clear, mostly front-on shots, and may need a manual nudge on angled or blurry ones.</p>
+
+    <div class="toolbar" style="margin-top:14px; margin-bottom:0;">
+      <button id="addMoreBtn" class="ghost">+ Add more images</button>
+      <button id="resetBtn" class="ghost">Start over</button>
+      <span style="flex:1"></span>
+      <button id="applyBtn">Download this image</button>
+      <button id="applyAllBtn" class="primary">Redact all &amp; download ZIP</button>
+    </div>
+  </div>
+
+  <footer>Processing is done locally on your device using the Canvas API. No images leave your browser.</footer>
+</div>
+
+<script>
+(function(){
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const uploadPanel = document.getElementById('uploadPanel');
+  const editPanel = document.getElementById('editPanel');
+  const stage = document.getElementById('stage');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const strengthInput = document.getElementById('strength');
+  const modeBlurBtn = document.getElementById('modeBlur');
+  const modeBlockBtn = document.getElementById('modeBlock');
+  const addBoxBtn = document.getElementById('addBoxBtn');
+  const autoBtn = document.getElementById('autoBtn');
+  const applyBtn = document.getElementById('applyBtn');
+  const applyAllBtn = document.getElementById('applyAllBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const addMoreBtn = document.getElementById('addMoreBtn');
+  const thumbstrip = document.getElementById('thumbstrip');
+
+  let mode = 'blur';
+  let images = [];
+  let currentIndex = -1;
+  let boxEls = [];
+  let idCounter = 0;
+
+  function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+
+  function handleFiles(fileList){
+    const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
+    if(!files.length) return;
+    let pending = files.length;
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const image = new Image();
+        image.onload = () => {
+          const entry = {
+            id: 'img' + (idCounter++),
+            name: file.name,
+            img: image,
+            naturalW: image.naturalWidth,
+            naturalH: image.naturalHeight,
+            boxes: [],
+            detected: false
+          };
+          const det = autoDetectPlate(image, entry.naturalW, entry.naturalH);
+          entry.boxes.push(det.box);
+          entry.detected = det.found;
+          images.push(entry);
+          if(currentIndex === -1) currentIndex = 0;
+          renderThumbs();
+          if(images.length === 1){ selectImage(0); }
+          uploadPanel.style.display = 'none';
+          editPanel.style.display = 'block';
+          pending--;
+          if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images loaded') : 'Image loaded';
+        };
+        image.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', (e) => { handleFiles(e.target.files); fileInput.value=''; });
+  ['dragenter','dragover'].forEach(evt => dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(evt => dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.remove('drag'); }));
+  dropzone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files));
+
+  addMoreBtn.addEventListener('click', () => fileInput.click());
+
+  function renderThumbs(){
+    thumbstrip.innerHTML = '';
+    images.forEach((entry, i) => {
+      const t = document.createElement('div');
+      t.className = 'thumb' + (i === currentIndex ? ' active' : '');
+      const im = document.createElement('img');
+      im.src = entry.img.src;
+      t.appendChild(im);
+      const badge = document.createElement('div');
+      badge.className = 'badge' + (entry.detected ? '' : ' none');
+      badge.textContent = entry.detected ? 'auto' : 'manual';
+      t.appendChild(badge);
+      const rm = document.createElement('div');
+      rm.className = 'remove';
+      rm.textContent = 'x';
+      rm.addEventListener('click', (e) => {
+        e.stopPropagation();
+        images.splice(i, 1);
+        if(images.length === 0){
+          currentIndex = -1;
+          editPanel.style.display = 'none';
+          uploadPanel.style.display = 'block';
+        } else {
+          if(currentIndex >= images.length) currentIndex = images.length - 1;
+          selectImage(currentIndex);
+        }
+        renderThumbs();
+      });
+      t.appendChild(rm);
+      t.addEventListener('click', () => selectImage(i));
+      thumbstrip.appendChild(t);
+    });
+  }
+
+  function selectImage(i){
+    currentIndex = i;
+    const entry = images[i];
+    canvas.width = entry.naturalW;
+    canvas.height = entry.naturalH;
+    ctx.clearRect(0,0,canvas.width, canvas.height);
+    ctx.drawImage(entry.img, 0, 0);
+    stage.classList.add('show');
+    renderBoxes();
+    renderThumbs();
+  }
+
+  function clearBoxEls(){ boxEls.forEach(el => el.remove()); boxEls = []; }
+
+  function renderBoxes(){
+    clearBoxEls();
+    if(currentIndex === -1) return;
+    const entry = images[currentIndex];
+    entry.boxes.forEach((b, i) => {
+      const el = document.createElement('div');
+      el.className = 'box';
+      el.innerHTML = '<div class="tag">Plate ' + (i+1) + (entry.boxes.length>1 ? ' (double-click to remove)' : '') + '</div><div class="handle"></div>';
+      stage.appendChild(el);
+      boxEls.push(el);
+      positionBoxEl(el, b);
+
+      let dragging = false, resizing = false, startX=0, startY=0, startB=null;
+
+      function down(clientX, clientY, isHandle){
+        if(isHandle) resizing = true; else dragging = true;
+        startX = clientX; startY = clientY;
+        startB = Object.assign({}, b);
+      }
+      function move(clientX, clientY){
+        if(!dragging && !resizing) return;
+        const rect = stage.getBoundingClientRect();
+        const dxPct = (clientX - startX) / rect.width;
+        const dyPct = (clientY - startY) / rect.height;
+        if(dragging){
+          b.xPct = clamp(startB.xPct + dxPct, 0, 1 - b.wPct);
+          b.yPct = clamp(startB.yPct + dyPct, 0, 1 - b.hPct);
+        } else if(resizing){
+          b.wPct = clamp(startB.wPct + dxPct, 0.04, 1 - b.xPct);
+          b.hPct = clamp(startB.hPct + dyPct, 0.03, 1 - b.yPct);
+        }
+        positionBoxEl(el, b);
+      }
+      function up(){ dragging = false; resizing = false; }
+
+      el.addEventListener('mousedown', (e) => { down(e.clientX, e.clientY, e.target.classList.contains('handle')); e.preventDefault(); e.stopPropagation(); });
+      window.addEventListener('mousemove', (e) => move(e.clientX, e.clientY));
+      window.addEventListener('mouseup', up);
+
+      el.addEventListener('touchstart', (e) => { const t=e.touches[0]; down(t.clientX, t.clientY, e.target.classList.contains('handle')); e.preventDefault(); e.stopPropagation(); }, {passive:false});
+      window.addEventListener('touchmove', (e) => { if(dragging||resizing){ const t=e.touches[0]; move(t.clientX, t.clientY); } }, {passive:false});
+      window.addEventListener('touchend', up);
+
+      el.addEventListener('dblclick', () => {
+        if(entry.boxes.length > 1){
+          const idx = entry.boxes.indexOf(b);
+          entry.boxes.splice(idx,1);
+          renderBoxes();
+        }
+      });
+    });
+  }
+
+  function positionBoxEl(el, b){
+    el.style.left = (b.xPct*100) + '%';
+    el.style.top = (b.yPct*100) + '%';
+    el.style.width = (b.wPct*100) + '%';
+    el.style.height = (b.hPct*100) + '%';
+  }
+
+  addBoxBtn.addEventListener('click', () => {
+    if(currentIndex === -1) return;
+    images[currentIndex].boxes.push({xPct:0.32, yPct:0.62, wPct:0.32, hPct:0.12});
+    renderBoxes();
+  });
+
+  autoBtn.addEventListener('click', () => {
+    if(currentIndex === -1) return;
+    const entry = images[currentIndex];
+    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH);
+    entry.boxes = [det.box];
+    entry.detected = det.found;
+    renderBoxes();
+    renderThumbs();
+    statusEl.textContent = det.found ? 'Auto-detected a likely plate region' : 'No confident match - placed a default box, please adjust';
+  });
+
+  modeBlurBtn.addEventListener('click', () => {
+    mode = 'blur'; modeBlurBtn.classList.add('active'); modeBlockBtn.classList.remove('active');
+    document.getElementById('strengthField').style.display = 'flex';
+  });
+  modeBlockBtn.addEventListener('click', () => {
+    mode = 'block'; modeBlockBtn.classList.add('active'); modeBlurBtn.classList.remove('active');
+    document.getElementById('strengthField').style.display = 'none';
+  });
+
+  resetBtn.addEventListener('click', () => {
+    images = [];
+    currentIndex = -1;
+    editPanel.style.display = 'none';
+    stage.classList.remove('show');
+    uploadPanel.style.display = 'block';
+    fileInput.value = '';
+    clearBoxEls();
+    thumbstrip.innerHTML = '';
+    statusEl.textContent = '';
+  });
+
+  function renderRedactedCanvas(entry){
+    const c = document.createElement('canvas');
+    c.width = entry.naturalW; c.height = entry.naturalH;
+    const cctx = c.getContext('2d');
+    cctx.drawImage(entry.img, 0, 0, entry.naturalW, entry.naturalH);
+    const strength = parseInt(strengthInput.value, 10);
+    entry.boxes.forEach(b => {
+      const x = b.xPct * entry.naturalW;
+      const y = b.yPct * entry.naturalH;
+      const w = b.wPct * entry.naturalW;
+      const h = b.hPct * entry.naturalH;
+      if(mode === 'block'){
+        cctx.fillStyle = '#0a0a0a';
+        cctx.fillRect(x, y, w, h);
+      } else {
+        const factor = Math.max(2, Math.round(strength / 2));
+        const tmp = document.createElement('canvas');
+        const sw = Math.max(1, Math.floor(w / factor));
+        const sh = Math.max(1, Math.floor(h / factor));
+        tmp.width = sw; tmp.height = sh;
+        const tctx = tmp.getContext('2d');
+        tctx.drawImage(c, x, y, w, h, 0, 0, sw, sh);
+        cctx.imageSmoothingEnabled = false;
+        cctx.drawImage(tmp, 0, 0, sw, sh, x, y, w, h);
+        cctx.imageSmoothingEnabled = true;
+      }
+    });
+    return c;
+  }
+
+  applyBtn.addEventListener('click', () => {
+    if(currentIndex === -1) return;
+    const entry = images[currentIndex];
+    const c = renderRedactedCanvas(entry);
+    const link = document.createElement('a');
+    const base = entry.name.replace(/\.[^.]+$/, '');
+    link.download = base + '-redacted.png';
+    link.href = c.toDataURL('image/png');
+    link.click();
+    statusEl.textContent = 'Downloaded ' + link.download;
+  });
+
+  applyAllBtn.addEventListener('click', async () => {
+    if(!images.length) return;
+    if(images.length === 1){ applyBtn.click(); return; }
+    statusEl.textContent = 'Preparing ZIP...';
+    applyAllBtn.disabled = true;
+    try{
+      const zip = new JSZip();
+      images.forEach(entry => {
+        const c = renderRedactedCanvas(entry);
+        const dataUrl = c.toDataURL('image/png');
+        const base64 = dataUrl.split(',')[1];
+        const base = entry.name.replace(/\.[^.]+$/, '');
+        zip.file(base + '-redacted.png', base64, {base64:true});
+      });
+      const blob = await zip.generateAsync({type:'blob'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.download = 'redacted-plates.zip';
+      link.href = url;
+      link.click();
+      URL.revokeObjectURL(url);
+      statusEl.textContent = 'Downloaded redacted-plates.zip (' + images.length + ' images)';
+    } finally {
+      applyAllBtn.disabled = false;
+    }
+  });
+
+  function autoDetectPlate(image, naturalW, naturalH){
+    const maxDim = 380;
+    const scale = Math.min(1, maxDim / Math.max(naturalW, naturalH));
+    const w = Math.max(20, Math.round(naturalW * scale));
+    const h = Math.max(20, Math.round(naturalH * scale));
+
+    const off = document.createElement('canvas');
+    off.width = w; off.height = h;
+    const octx = off.getContext('2d');
+    octx.drawImage(image, 0, 0, w, h);
+    const data = octx.getImageData(0, 0, w, h).data;
+
+    const gray = new Float32Array(w*h);
+    for(let i=0, p=0; i<data.length; i+=4, p++){
+      gray[p] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+    }
+
+    const mag = new Float32Array(w*h);
+    let sum = 0;
+    for(let y=1; y<h-1; y++){
+      for(let x=1; x<w-1; x++){
+        const i = y*w+x;
+        const gx = gray[i-w-1] - gray[i-w+1] + 2*gray[i-1] - 2*gray[i+1] + gray[i+w-1] - gray[i+w+1];
+        const gy = gray[i-w-1] + 2*gray[i-w] + gray[i-w+1] - gray[i+w-1] - 2*gray[i+w] - gray[i+w+1];
+        const m = Math.sqrt(gx*gx + gy*gy);
+        mag[i] = m;
+        sum += m;
+      }
+    }
+    const meanMag = sum / (w*h);
+    const threshold = meanMag * 1.3;
+    const edge = new Float32Array(w*h);
+    for(let i=0;i<w*h;i++) edge[i] = mag[i] > threshold ? 1 : 0;
+
+    const ii = (arr) => {
+      const int = new Float64Array((w+1)*(h+1));
+      for(let y=0; y<h; y++){
+        let rowSum = 0;
+        for(let x=0; x<w; x++){
+          rowSum += arr[y*w+x];
+          int[(y+1)*(w+1)+(x+1)] = int[y*(w+1)+(x+1)] + rowSum;
+        }
+      }
+      return int;
+    };
+    const edgeInt = ii(edge);
+    const graySqArr = new Float32Array(w*h);
+    for(let i=0;i<w*h;i++) graySqArr[i] = gray[i]*gray[i];
+    const grayInt = ii(gray);
+    const graySqInt = ii(graySqArr);
+
+    function boxSum(int, x, y, bw, bh){
+      const x2 = x+bw, y2 = y+bh;
+      return int[y2*(w+1)+x2] - int[y*(w+1)+x2] - int[y2*(w+1)+x] + int[y*(w+1)+x];
+    }
+
+    const aspects = [2.2, 2.6, 3.0, 3.6, 4.2, 5.0];
+    const wFracs = [0.15, 0.22, 0.30, 0.40, 0.50];
+
+    let best = null;
+
+    aspects.forEach(aspect => {
+      wFracs.forEach(wFrac => {
+        const bw = Math.round(wFrac * w);
+        const bh = Math.round(bw / aspect);
+        if(bh < 6 || bw >= w || bh >= h) return;
+        const stride = Math.max(4, Math.round(bw * 0.25));
+        for(let y=0; y+bh<=h; y+=stride){
+          for(let x=0; x+bw<=w; x+=stride){
+            const area = bw*bh;
+            const eSum = boxSum(edgeInt, x, y, bw, bh);
+            const density = eSum / area;
+            if(density < 0.05) continue;
+
+            const gSum = boxSum(grayInt, x, y, bw, bh);
+            const gSqSum = boxSum(graySqInt, x, y, bw, bh);
+            const meanG = gSum / area;
+            const variance = Math.max(0, gSqSum/area - meanG*meanG);
+            const std = Math.sqrt(variance);
+            const contrastScore = clamp(std / 55, 0, 1);
+
+            const yc = (y + bh/2) / h;
+            const posPrior = yc > 0.35 ? 1 : clamp(yc/0.35, 0.15, 1) * 0.6;
+
+            const xc = (x + bw/2) / w;
+            const xPrior = 1 - Math.abs(xc - 0.5) * 0.4;
+
+            const score = density * contrastScore * posPrior * xPrior;
+
+            if(!best || score > best.score){
+              best = {x, y, w: bw, h: bh, score};
+            }
+          }
+        }
+      });
+    });
+
+    if(best && best.score > 0.02){
+      return {
+        found: true,
+        box: {
+          xPct: best.x / w,
+          yPct: best.y / h,
+          wPct: best.w / w,
+          hPct: best.h / h
+        }
+      };
+    }
+
+    return {
+      found: false,
+      box: { xPct: 0.32, yPct: 0.62, wPct: 0.32, hPct: 0.12 }
+    };
+  }
+
+})();
+</script>
+</body>
+</html>

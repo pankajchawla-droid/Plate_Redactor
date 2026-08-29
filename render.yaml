@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: plate-redactor
+    runtime: static
+    staticPublishPath: .
+    buildCommand: ""
+    envVars: []
