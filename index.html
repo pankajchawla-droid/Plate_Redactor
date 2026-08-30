@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>Plate Redactor</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
   :root{
     --ink:#1a1d1a;
@@ -164,7 +165,7 @@
       <button id="addBoxBtn">+ Add box</button>
       <span style="width:1px; align-self:stretch; background:var(--line);"></span>
       <button id="setTemplateBtn">📌 Set as template</button>
-      <button id="matchAllBtn" class="primary" disabled>▶ Match to all images</button>
+      <button id="matchAllBtn" class="primary">▶ Match to all images</button>
       <span class="status" id="status"></span>
     </div>
 
@@ -174,7 +175,18 @@
 
     <p class="hint">Auto-detect on upload is a whole-image best guess and can miss. For a batch of similar photos (same camera angle/setup), the reliable route is: fix the box on <strong>one</strong> image, click <strong>📌 Set as template</strong>, then <strong>▶ Match to all images</strong> — it searches for that same visual patch in each other photo. Drag a box to reposition, drag the corner dot to resize, double-click a box to remove it.</p>
 
-    <div class="toolbar" style="margin-top:14px; margin-bottom:0;">
+    <div class="toolbar" style="margin-top:14px;">
+      <label class="field" style="flex:1; min-width:200px;">
+        Plate text
+        <input type="text" id="plateTextInput" placeholder="Not read yet" style="flex:1; padding:6px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; font-size:13.5px;">
+      </label>
+      <button id="ocrOneBtn">🔍 Read this image</button>
+      <button id="ocrAllBtn">🔁 Read all images</button>
+      <button id="exportCsvBtn" class="ghost">📄 Export list (CSV)</button>
+    </div>
+    <p class="hint" id="ocrHint">OCR reads the text inside the box — it's a best-effort guess (accuracy varies with angle, lighting, and blur), so please double check and correct it if needed. The first read loads an OCR engine, which can take a few seconds.</p>
+
+    <div class="toolbar" style="margin-bottom:0;">
       <button id="addMoreBtn" class="ghost">+ Add more images</button>
       <button id="resetBtn" class="ghost">Start over</button>
       <span style="flex:1"></span>
@@ -208,6 +220,11 @@
   const applyAllBtn = document.getElementById('applyAllBtn');
   const resetBtn = document.getElementById('resetBtn');
   const addMoreBtn = document.getElementById('addMoreBtn');
+  const plateTextInput = document.getElementById('plateTextInput');
+  const ocrOneBtn = document.getElementById('ocrOneBtn');
+  const ocrAllBtn = document.getElementById('ocrAllBtn');
+  const exportCsvBtn = document.getElementById('exportCsvBtn');
+  const ocrHint = document.getElementById('ocrHint');
   const thumbstrip = document.getElementById('thumbstrip');
 
   let mode = 'blur';
@@ -237,7 +254,8 @@
             naturalH: image.naturalHeight,
             boxes: [],
             detected: false,
-            method: 'none'
+            method: 'none',
+            plateText: ''
           };
           const det = autoDetectPlate(image, entry.naturalW, entry.naturalH);
           entry.boxes.push(det.box);
@@ -249,7 +267,6 @@
           if(images.length === 1){ selectImage(0); }
           uploadPanel.style.display = 'none';
           editPanel.style.display = 'block';
-          matchAllBtn.disabled = !(template && images.length > 1);
           pending--;
           if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images loaded') : 'Image loaded';
         };
@@ -305,7 +322,6 @@
           if(currentIndex >= images.length) currentIndex = images.length - 1;
           selectImage(currentIndex);
         }
-        matchAllBtn.disabled = !(template && images.length > 1);
         renderThumbs();
       });
       t.appendChild(rm);
@@ -324,6 +340,7 @@
     stage.classList.add('show');
     renderBoxes();
     renderThumbs();
+    plateTextInput.value = entry.plateText || '';
   }
 
   function clearBoxEls(){ boxEls.forEach(el => el.remove()); boxEls = []; }
@@ -412,12 +429,18 @@
     if(!entry.boxes.length){ statusEl.textContent = 'Add a box on this image first'; return; }
     const box = entry.boxes[0];
     template = buildTemplate(entry.img, entry.naturalW, entry.naturalH, box, entry.id);
-    matchAllBtn.disabled = images.length <= 1;
     statusEl.textContent = 'Template set from "' + entry.name + '" — now click Match to all images';
   });
 
   matchAllBtn.addEventListener('click', () => {
-    if(!template) return;
+    if(!template){
+      statusEl.textContent = 'Set a template first: fix the box on one image, then click 📌 Set as template.';
+      return;
+    }
+    if(images.length <= 1){
+      statusEl.textContent = 'Add at least one more image to match against.';
+      return;
+    }
     let matched = 0, weak = 0;
     images.forEach(entry => {
       if(entry.id === template.sourceId) return;
@@ -474,7 +497,6 @@
     images = [];
     currentIndex = -1;
     template = null;
-    matchAllBtn.disabled = true;
     editPanel.style.display = 'none';
     stage.classList.remove('show');
     uploadPanel.style.display = 'block';
@@ -482,6 +504,7 @@
     clearBoxEls();
     thumbstrip.innerHTML = '';
     statusEl.textContent = '';
+    plateTextInput.value = '';
   });
 
   function renderRedactedCanvas(entry){
@@ -551,6 +574,140 @@
     } finally {
       applyAllBtn.disabled = false;
     }
+  });
+
+  // ---------- OCR: best-effort plate text reading ----------
+  // Uses Tesseract.js loaded from a CDN. This is a convenience feature only —
+  // it never blocks or affects the actual redaction/download flow, and if the
+  // OCR engine can't load (e.g. no internet, or blocked in some preview
+  // environments) everything else keeps working; you can still type the
+  // plate text in manually.
+
+  let ocrWorkerPromise = null;
+  function getOcrWorker(){
+    if(!ocrWorkerPromise){
+      ocrWorkerPromise = (async () => {
+        if(typeof Tesseract === 'undefined') throw new Error('OCR library did not load');
+        const worker = await Tesseract.createWorker('eng');
+        try{
+          await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' });
+        } catch(e){ /* older/newer API differences — safe to ignore */ }
+        return worker;
+      })();
+    }
+    return ocrWorkerPromise;
+  }
+
+  function extractPlateCropCanvas(entry){
+    if(!entry.boxes.length) return null;
+    const b = entry.boxes[0];
+    const x = Math.round(b.xPct * entry.naturalW);
+    const y = Math.round(b.yPct * entry.naturalH);
+    const w = Math.round(b.wPct * entry.naturalW);
+    const h = Math.round(b.hPct * entry.naturalH);
+    if(w < 4 || h < 4) return null;
+
+    // Upscale small crops and boost contrast a little — helps OCR on
+    // low-resolution plate regions.
+    const targetH = 90;
+    const scale = Math.max(1, targetH / h);
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+
+    const c = document.createElement('canvas');
+    c.width = outW; c.height = outH;
+    const cx = c.getContext('2d');
+    cx.imageSmoothingEnabled = true;
+    cx.drawImage(entry.img, x, y, w, h, 0, 0, outW, outH);
+
+    const imgData = cx.getImageData(0, 0, outW, outH);
+    const d = imgData.data;
+    for(let i=0; i<d.length; i+=4){
+      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+      const boosted = clamp((gray - 128) * 1.4 + 128, 0, 255);
+      d[i] = d[i+1] = d[i+2] = boosted;
+    }
+    cx.putImageData(imgData, 0, 0);
+    return c;
+  }
+
+  function cleanPlateText(raw){
+    return (raw || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  async function readPlateText(entry){
+    const crop = extractPlateCropCanvas(entry);
+    if(!crop) return '';
+    const worker = await getOcrWorker();
+    const { data } = await worker.recognize(crop);
+    return cleanPlateText(data.text);
+  }
+
+  plateTextInput.addEventListener('input', () => {
+    if(currentIndex === -1) return;
+    images[currentIndex].plateText = plateTextInput.value;
+  });
+
+  ocrOneBtn.addEventListener('click', async () => {
+    if(currentIndex === -1) return;
+    const entry = images[currentIndex];
+    ocrOneBtn.disabled = true;
+    statusEl.textContent = 'Reading plate text…';
+    try{
+      const text = await readPlateText(entry);
+      entry.plateText = text || '(no text found — try adjusting the box)';
+      plateTextInput.value = entry.plateText;
+      statusEl.textContent = text ? 'Read complete — please verify it' : 'Nothing legible found — adjust the box or type it in manually';
+    } catch(err){
+      console.warn('OCR failed', err);
+      statusEl.textContent = 'OCR engine unavailable right now — you can type the plate text in manually';
+    } finally {
+      ocrOneBtn.disabled = false;
+    }
+  });
+
+  ocrAllBtn.addEventListener('click', async () => {
+    if(!images.length) return;
+    ocrAllBtn.disabled = true;
+    let done = 0, failed = 0;
+    for(const entry of images){
+      statusEl.textContent = 'Reading ' + (done + failed + 1) + ' of ' + images.length + '…';
+      try{
+        const text = await readPlateText(entry);
+        entry.plateText = text || '(no text found)';
+        done++;
+      } catch(err){
+        console.warn('OCR failed for', entry.name, err);
+        failed++;
+        // If the engine itself is unavailable, no point retrying every image.
+        if(!ocrWorkerPromise) break;
+      }
+    }
+    if(images[currentIndex]) plateTextInput.value = images[currentIndex].plateText || '';
+    renderThumbs();
+    ocrAllBtn.disabled = false;
+    statusEl.textContent = failed
+      ? ('Read ' + done + ' image' + (done===1?'':'s') + (failed ? ', ' + failed + ' failed — OCR may be unavailable, type those in manually' : ''))
+      : ('Read ' + done + ' image' + (done===1?'':'s') + ' — please verify the results');
+  });
+
+  exportCsvBtn.addEventListener('click', () => {
+    if(!images.length) return;
+    const rows = [['File', 'Plate text']];
+    images.forEach(entry => rows.push([entry.name, entry.plateText || '']));
+    const csv = rows.map(r => r.map(cell => '"' + String(cell).replace(/"/g,'""') + '"').join(',')).join('\r\n');
+    const blob = new Blob([csv], {type:'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.download = 'plate-list.csv';
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+    statusEl.textContent = 'Downloaded plate-list.csv';
   });
 
   // ---------- Template matching (propagate one hand-set box to a batch) ----------
