@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <title>Plate Redactor</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <style>
   :root{
     --ink:#1a1d1a;
@@ -138,7 +136,7 @@
   <header>
     <p class="eyebrow">Privacy tool</p>
     <h1>Plate Redactor</h1>
-    <p class="sub">Upload one or more vehicle photos. A vehicle-detection model finds the car first, then the plate is located within it automatically — no clicking required. Fine-tune or manually redirect it if needed, then blur or black out and download. Everything runs locally in your browser; nothing is uploaded anywhere.</p>
+    <p class="sub">Upload a batch of similarly-framed vehicle photos. Mark the plate on the first one, then hit "Match to all" — it finds that same patch in every other photo using local pattern matching, no need to mark each one by hand. Fine-tune any that miss, then blur or black out and download. Everything runs locally in your browser; nothing is uploaded anywhere.</p>
   </header>
 
   <div class="panel" id="uploadPanel">
@@ -164,6 +162,9 @@
       <button id="autoBtn">Re-run auto-detect</button>
       <button id="pickBtn">🎯 Click on plate</button>
       <button id="addBoxBtn">+ Add box</button>
+      <span style="width:1px; align-self:stretch; background:var(--line);"></span>
+      <button id="setTemplateBtn">📌 Set as template</button>
+      <button id="matchAllBtn" class="primary" disabled>▶ Match to all images</button>
       <span class="status" id="status"></span>
     </div>
 
@@ -171,7 +172,7 @@
       <canvas id="canvas"></canvas>
     </div>
 
-    <p class="hint">Detection runs a vehicle-locator model first, then searches within the vehicle for the plate — this is far more reliable than scanning the whole photo blind. If it still lands wrong (unusual angle, multiple vehicles, cluttered background), click <strong>🎯 Click on plate</strong> and tap the plate directly. Drag a box to reposition it, drag the orange dot at its corner to resize, double-click a box to remove it.</p>
+    <p class="hint">Auto-detect on upload is a whole-image best guess and can miss. For a batch of similar photos (same camera angle/setup), the reliable route is: fix the box on <strong>one</strong> image, click <strong>📌 Set as template</strong>, then <strong>▶ Match to all images</strong> — it searches for that same visual patch in each other photo. Drag a box to reposition, drag the corner dot to resize, double-click a box to remove it.</p>
 
     <div class="toolbar" style="margin-top:14px; margin-bottom:0;">
       <button id="addMoreBtn" class="ghost">+ Add more images</button>
@@ -201,6 +202,8 @@
   const addBoxBtn = document.getElementById('addBoxBtn');
   const autoBtn = document.getElementById('autoBtn');
   const pickBtn = document.getElementById('pickBtn');
+  const setTemplateBtn = document.getElementById('setTemplateBtn');
+  const matchAllBtn = document.getElementById('matchAllBtn');
   const applyBtn = document.getElementById('applyBtn');
   const applyAllBtn = document.getElementById('applyAllBtn');
   const resetBtn = document.getElementById('resetBtn');
@@ -213,61 +216,7 @@
   let boxEls = [];
   let idCounter = 0;
   let pickMode = false;
-
-  let vehicleModel = null;
-  let vehicleModelPromise = null;
-  let vehicleModelFailed = false;
-
-  function getVehicleModel(){
-    if(vehicleModel) return Promise.resolve(vehicleModel);
-    if(vehicleModelFailed) return Promise.resolve(null);
-    if(!vehicleModelPromise){
-      vehicleModelPromise = (typeof cocoSsd !== 'undefined' ? cocoSsd.load() : Promise.reject(new Error('unavailable')))
-        .then(m => { vehicleModel = m; return m; })
-        .catch(err => { vehicleModelFailed = true; console.warn('Vehicle model unavailable, falling back to heuristic-only detection.', err); return null; });
-    }
-    return vehicleModelPromise;
-  }
-
-  const VEHICLE_CLASSES = ['car','truck','bus','motorcycle'];
-
-  async function detectVehicleBox(image, naturalW, naturalH){
-    const model = await getVehicleModel();
-    if(!model) return null;
-    try{
-      const predictions = await model.detect(image);
-      const vehicles = predictions.filter(p => VEHICLE_CLASSES.includes(p.class) && p.score > 0.4);
-      if(!vehicles.length) return null;
-      vehicles.sort((a,b) => (b.bbox[2]*b.bbox[3]) - (a.bbox[2]*a.bbox[3]));
-      const [x,y,w,h] = vehicles[0].bbox;
-      return {
-        xPct: clamp(x / naturalW, 0, 1),
-        yPct: clamp(y / naturalH, 0, 1),
-        wPct: clamp(w / naturalW, 0, 1),
-        hPct: clamp(h / naturalH, 0, 1)
-      };
-    } catch(err){
-      console.warn('Vehicle detection failed for this image.', err);
-      return null;
-    }
-  }
-
-  async function detectPlateForImage(image, naturalW, naturalH){
-    const vehicleBox = await detectVehicleBox(image, naturalW, naturalH);
-    if(vehicleBox){
-      const region = {
-        xPct: vehicleBox.xPct,
-        yPct: vehicleBox.yPct + vehicleBox.hPct * 0.25,
-        wPct: vehicleBox.wPct,
-        hPct: vehicleBox.hPct * 0.75
-      };
-      const det = autoDetectPlate(image, naturalW, naturalH, { region });
-      if(det.found) return { box: det.box, method: 'vehicle' };
-      return { box: det.box, method: 'vehicle-weak' };
-    }
-    const det = autoDetectPlate(image, naturalW, naturalH);
-    return { box: det.box, method: det.found ? 'heuristic' : 'none' };
-  }
+  let template = null; // {gray, outW, outH, wPct, hPct, sourceId}
 
   function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 
@@ -275,12 +224,11 @@
     const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
     if(!files.length) return;
     let pending = files.length;
-    statusEl.textContent = 'Loading detection model…';
     files.forEach(file => {
       const reader = new FileReader();
       reader.onload = (e) => {
         const image = new Image();
-        image.onload = async () => {
+        image.onload = () => {
           const entry = {
             id: 'img' + (idCounter++),
             name: file.name,
@@ -291,22 +239,19 @@
             detected: false,
             method: 'none'
           };
+          const det = autoDetectPlate(image, entry.naturalW, entry.naturalH);
+          entry.boxes.push(det.box);
+          entry.detected = det.found;
+          entry.method = det.found ? 'heuristic' : 'none';
           images.push(entry);
           if(currentIndex === -1) currentIndex = 0;
           renderThumbs();
           if(images.length === 1){ selectImage(0); }
           uploadPanel.style.display = 'none';
           editPanel.style.display = 'block';
-
-          const result = await detectPlateForImage(image, entry.naturalW, entry.naturalH);
-          entry.boxes.push(result.box);
-          entry.detected = result.method === 'vehicle';
-          entry.method = result.method;
-          renderThumbs();
-          if(images[currentIndex] === entry) renderBoxes();
-
+          matchAllBtn.disabled = !(template && images.length > 1);
           pending--;
-          if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images processed') : 'Image processed';
+          if(pending === 0) statusEl.textContent = files.length > 1 ? (files.length + ' images loaded') : 'Image loaded';
         };
         image.src = e.target.result;
       };
@@ -331,8 +276,15 @@
       im.src = entry.img.src;
       t.appendChild(im);
       const badge = document.createElement('div');
-      const badgeText = { vehicle: 'auto', 'vehicle-weak': 'auto*', heuristic: 'auto*', none: 'manual' }[entry.method] || 'manual';
-      const badgeGood = entry.method === 'vehicle';
+      const badgeMap = {
+        template: 'matched',
+        'template-weak': 'matched*',
+        click: 'clicked',
+        heuristic: 'auto*',
+        none: 'manual'
+      };
+      const badgeText = badgeMap[entry.method] || 'manual';
+      const badgeGood = entry.method === 'template' || entry.method === 'click';
       badge.className = 'badge' + (badgeGood ? '' : ' none');
       badge.textContent = badgeText;
       t.appendChild(badge);
@@ -341,15 +293,19 @@
       rm.textContent = 'x';
       rm.addEventListener('click', (e) => {
         e.stopPropagation();
+        const removedEntry = entry;
         images.splice(i, 1);
+        if(template && template.sourceId === removedEntry.id) template = null;
         if(images.length === 0){
           currentIndex = -1;
           editPanel.style.display = 'none';
           uploadPanel.style.display = 'block';
+          template = null;
         } else {
           if(currentIndex >= images.length) currentIndex = images.length - 1;
           selectImage(currentIndex);
         }
+        matchAllBtn.disabled = !(template && images.length > 1);
         renderThumbs();
       });
       t.appendChild(rm);
@@ -438,19 +394,42 @@
     renderBoxes();
   });
 
-  autoBtn.addEventListener('click', async () => {
+  autoBtn.addEventListener('click', () => {
     if(currentIndex === -1) return;
     const entry = images[currentIndex];
-    statusEl.textContent = 'Re-detecting…';
-    const result = await detectPlateForImage(entry.img, entry.naturalW, entry.naturalH);
-    entry.boxes = [result.box];
-    entry.detected = result.method === 'vehicle';
-    entry.method = result.method;
+    const det = autoDetectPlate(entry.img, entry.naturalW, entry.naturalH);
+    entry.boxes = [det.box];
+    entry.detected = det.found;
+    entry.method = det.found ? 'heuristic' : 'none';
     renderBoxes();
     renderThumbs();
-    statusEl.textContent = result.method === 'vehicle' ? 'Detected via vehicle + plate model'
-      : result.method === 'heuristic' ? 'No vehicle found — used a whole-image best guess'
-      : 'Low confidence — please adjust or use Click on plate';
+    statusEl.textContent = det.found ? 'Auto-detected a likely plate region — please double-check it' : 'No confident match — placed a default box, please adjust';
+  });
+
+  setTemplateBtn.addEventListener('click', () => {
+    if(currentIndex === -1) return;
+    const entry = images[currentIndex];
+    if(!entry.boxes.length){ statusEl.textContent = 'Add a box on this image first'; return; }
+    const box = entry.boxes[0];
+    template = buildTemplate(entry.img, entry.naturalW, entry.naturalH, box, entry.id);
+    matchAllBtn.disabled = images.length <= 1;
+    statusEl.textContent = 'Template set from "' + entry.name + '" — now click Match to all images';
+  });
+
+  matchAllBtn.addEventListener('click', () => {
+    if(!template) return;
+    let matched = 0, weak = 0;
+    images.forEach(entry => {
+      if(entry.id === template.sourceId) return;
+      const result = matchTemplateInImage(template, entry.img, entry.naturalW, entry.naturalH);
+      entry.boxes = [result.box];
+      entry.method = result.confident ? 'template' : 'template-weak';
+      entry.detected = result.confident;
+      if(result.confident) matched++; else weak++;
+    });
+    renderBoxes();
+    renderThumbs();
+    statusEl.textContent = 'Matched ' + matched + ' image' + (matched===1?'':'s') + (weak ? ', ' + weak + ' low-confidence (please check)' : '');
   });
 
   pickBtn.addEventListener('click', () => {
@@ -494,6 +473,8 @@
   resetBtn.addEventListener('click', () => {
     images = [];
     currentIndex = -1;
+    template = null;
+    matchAllBtn.disabled = true;
     editPanel.style.display = 'none';
     stage.classList.remove('show');
     uploadPanel.style.display = 'block';
@@ -571,6 +552,115 @@
       applyAllBtn.disabled = false;
     }
   });
+
+  // ---------- Template matching (propagate one hand-set box to a batch) ----------
+  // Extracts a small fixed-size grayscale patch from the marked box on a
+  // reference image, then for every other image searches a local window
+  // around the same relative position for the sub-region whose grayscale
+  // pattern correlates best (normalized cross-correlation). Works well when
+  // photos share a similar camera angle/framing; falls back gracefully
+  // (low-confidence flag) when they don't.
+
+  function getDownscaledCanvas(image, naturalW, naturalH, maxDim){
+    const scale = Math.min(1, maxDim / Math.max(naturalW, naturalH));
+    const w = Math.max(20, Math.round(naturalW * scale));
+    const h = Math.max(20, Math.round(naturalH * scale));
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    c.getContext('2d').drawImage(image, 0, 0, w, h);
+    return { canvas: c, w, h };
+  }
+
+  function extractPatchGray(sourceCanvas, x, y, w, h, outW, outH){
+    const c = document.createElement('canvas');
+    c.width = outW; c.height = outH;
+    const cx = c.getContext('2d');
+    cx.drawImage(sourceCanvas, x, y, w, h, 0, 0, outW, outH);
+    const data = cx.getImageData(0, 0, outW, outH).data;
+    const gray = new Float32Array(outW * outH);
+    for(let i=0, p=0; i<data.length; i+=4, p++){
+      gray[p] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+    }
+    return gray;
+  }
+
+  function ncc(a, b){
+    const n = a.length;
+    let sumA=0, sumB=0;
+    for(let i=0;i<n;i++){ sumA += a[i]; sumB += b[i]; }
+    const meanA = sumA/n, meanB = sumB/n;
+    let num=0, denA=0, denB=0;
+    for(let i=0;i<n;i++){
+      const da = a[i]-meanA, db = b[i]-meanB;
+      num += da*db; denA += da*da; denB += db*db;
+    }
+    if(denA <= 1e-6 || denB <= 1e-6) return -1;
+    return num / Math.sqrt(denA*denB);
+  }
+
+  const TEMPLATE_MAX_DIM = 420;
+  const PATCH_W = 44;
+
+  function buildTemplate(image, naturalW, naturalH, box, sourceId){
+    const { canvas, w, h } = getDownscaledCanvas(image, naturalW, naturalH, TEMPLATE_MAX_DIM);
+    const bx = Math.round(box.xPct * w);
+    const by = Math.round(box.yPct * h);
+    const bw = Math.max(4, Math.round(box.wPct * w));
+    const bh = Math.max(4, Math.round(box.hPct * h));
+    const outW = PATCH_W;
+    const outH = Math.max(6, Math.round(PATCH_W * (bh / bw)));
+    const gray = extractPatchGray(canvas, bx, by, bw, bh, outW, outH);
+    return { gray, outW, outH, wPct: box.wPct, hPct: box.hPct, sourceId };
+  }
+
+  function matchTemplateInImage(tmpl, image, naturalW, naturalH){
+    const { canvas, w, h } = getDownscaledCanvas(image, naturalW, naturalH, TEMPLATE_MAX_DIM);
+
+    const baseW = tmpl.wPct * w;
+    const baseH = tmpl.hPct * h;
+    const scales = [0.75, 0.85, 1.0, 1.15, 1.3];
+
+    // Search the whole image rather than a tight local window, since
+    // vehicles can shift noticeably between shots even with a similar
+    // camera setup — normalized cross-correlation is what keeps this fast
+    // and selective enough to still be reliable.
+    let best = null;
+
+    scales.forEach(s => {
+      const bw = Math.max(6, Math.round(baseW * s));
+      const bh = Math.max(6, Math.round(baseH * s));
+      if(bw >= w || bh >= h) return;
+      const stride = Math.max(3, Math.round(bw * 0.12));
+      for(let y=0; y+bh<=h; y+=stride){
+        for(let x=0; x+bw<=w; x+=stride){
+          const patch = extractPatchGray(canvas, x, y, bw, bh, tmpl.outW, tmpl.outH);
+          const score = ncc(tmpl.gray, patch);
+          if(!best || score > best.score){
+            best = { x, y, w: bw, h: bh, score };
+          }
+        }
+      }
+    });
+
+    const confident = !!best && best.score > 0.35;
+
+    if(!best){
+      // Absolute fallback: paste at the template's own relative position/size
+      const bw = Math.max(6, Math.round(baseW));
+      const bh = Math.max(6, Math.round(baseH));
+      best = { x: Math.round(w*0.32 - bw/2), y: Math.round(h*0.62 - bh/2), w: bw, h: bh, score: 0 };
+    }
+
+    return {
+      confident,
+      box: {
+        xPct: clamp(best.x / w, 0, 1 - best.w/w),
+        yPct: clamp(best.y / h, 0, 1 - best.h/h),
+        wPct: best.w / w,
+        hPct: best.h / h
+      }
+    };
+  }
 
   function autoDetectPlate(image, naturalW, naturalH, opts){
     opts = opts || {};
