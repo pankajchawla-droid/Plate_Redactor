@@ -180,11 +180,12 @@
         Plate text
         <input type="text" id="plateTextInput" placeholder="Not read yet" style="flex:1; padding:6px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; font-size:13.5px;">
       </label>
+      <span id="plateMatchBadge" style="font-size:12px; font-weight:700; padding:3px 8px; border-radius:5px; display:none;"></span>
       <button id="ocrOneBtn">🔍 Read this image</button>
       <button id="ocrAllBtn">🔁 Read all images</button>
       <button id="exportCsvBtn" class="ghost">📄 Export list (CSV)</button>
     </div>
-    <p class="hint" id="ocrHint">OCR reads the text inside the box — it's a best-effort guess (accuracy varies with angle, lighting, and blur), so please double check and correct it if needed. The first read loads an OCR engine, which can take a few seconds.</p>
+    <p class="hint" id="ocrHint">OCR reads the text inside the box and checks it against real Indian state codes (DL, MH, KA, ...) to filter out noise — a green check means it found a valid state-code pattern; still worth a quick eyeball since misreads happen. First read loads the OCR engine, which can take a few seconds.</p>
 
     <div class="toolbar" style="margin-bottom:0;">
       <button id="addMoreBtn" class="ghost">+ Add more images</button>
@@ -221,6 +222,7 @@
   const resetBtn = document.getElementById('resetBtn');
   const addMoreBtn = document.getElementById('addMoreBtn');
   const plateTextInput = document.getElementById('plateTextInput');
+  const plateMatchBadge = document.getElementById('plateMatchBadge');
   const ocrOneBtn = document.getElementById('ocrOneBtn');
   const ocrAllBtn = document.getElementById('ocrAllBtn');
   const exportCsvBtn = document.getElementById('exportCsvBtn');
@@ -236,6 +238,23 @@
   let template = null; // {gray, outW, outH, wPct, hPct, sourceId}
 
   function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+
+  function updatePlateMatchBadge(entry){
+    if(!entry || !entry.plateText){
+      plateMatchBadge.style.display = 'none';
+      return;
+    }
+    plateMatchBadge.style.display = 'inline-block';
+    if(entry.plateMatched){
+      plateMatchBadge.textContent = '✓ state code matched';
+      plateMatchBadge.style.background = '#e3ede6';
+      plateMatchBadge.style.color = 'var(--accent)';
+    } else {
+      plateMatchBadge.textContent = '⚠ no state code found';
+      plateMatchBadge.style.background = '#f3e6e1';
+      plateMatchBadge.style.color = 'var(--danger)';
+    }
+  }
 
   function handleFiles(fileList){
     const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
@@ -255,7 +274,8 @@
             boxes: [],
             detected: false,
             method: 'none',
-            plateText: ''
+            plateText: '',
+            plateMatched: false
           };
           const det = autoDetectPlate(image, entry.naturalW, entry.naturalH);
           entry.boxes.push(det.box);
@@ -341,6 +361,7 @@
     renderBoxes();
     renderThumbs();
     plateTextInput.value = entry.plateText || '';
+    updatePlateMatchBadge(entry);
   }
 
   function clearBoxEls(){ boxEls.forEach(el => el.remove()); boxEls = []; }
@@ -505,6 +526,7 @@
     thumbstrip.innerHTML = '';
     statusEl.textContent = '';
     plateTextInput.value = '';
+    plateMatchBadge.style.display = 'none';
   });
 
   function renderRedactedCanvas(entry){
@@ -639,17 +661,39 @@
       .trim();
   }
 
+  // Indian state/UT registration codes — used to pull the actual plate
+  // string out of noisy OCR output rather than trusting the raw guess.
+  const INDIAN_STATE_CODES = [
+    'AP','AS','BR','CH','CG','DN','DL','GA','GJ','HR','HP','JK','JH','KA',
+    'KL','MP','MH','MN','OR','PY','PB','TR','TN','RJ','TS','UP','UK','WB'
+  ];
+  const STATE_CODE_RE = new RegExp('(' + INDIAN_STATE_CODES.join('|') + ')[A-Z0-9]{4,10}');
+
+  // Looks for <state code><RTO digits><series letters><number> inside the
+  // raw OCR text (spaces removed, since OCR often splits/merges groups).
+  // Returns the matched plate string, or null if no known state code is found.
+  function extractIndianPlate(rawText){
+    const compact = cleanPlateText(rawText).replace(/\s+/g, '');
+    const match = compact.match(STATE_CODE_RE);
+    return match ? match[0] : null;
+  }
+
   async function readPlateText(entry){
     const crop = extractPlateCropCanvas(entry);
-    if(!crop) return '';
+    if(!crop) return { text: '', matched: false };
     const worker = await getOcrWorker();
     const { data } = await worker.recognize(crop);
-    return cleanPlateText(data.text);
+    const matched = extractIndianPlate(data.text);
+    if(matched) return { text: matched, matched: true };
+    return { text: cleanPlateText(data.text), matched: false };
   }
 
   plateTextInput.addEventListener('input', () => {
     if(currentIndex === -1) return;
-    images[currentIndex].plateText = plateTextInput.value;
+    const entry = images[currentIndex];
+    entry.plateText = plateTextInput.value;
+    entry.plateMatched = !!extractIndianPlate(plateTextInput.value);
+    updatePlateMatchBadge(entry);
   });
 
   ocrOneBtn.addEventListener('click', async () => {
@@ -658,10 +702,15 @@
     ocrOneBtn.disabled = true;
     statusEl.textContent = 'Reading plate text…';
     try{
-      const text = await readPlateText(entry);
-      entry.plateText = text || '(no text found — try adjusting the box)';
+      const result = await readPlateText(entry);
+      entry.plateText = result.text || '(no text found — try adjusting the box)';
+      entry.plateMatched = result.matched;
       plateTextInput.value = entry.plateText;
-      statusEl.textContent = text ? 'Read complete — please verify it' : 'Nothing legible found — adjust the box or type it in manually';
+      updatePlateMatchBadge(entry);
+      statusEl.textContent = result.matched ? 'Read complete — matched a known state code'
+        : result.text ? 'Read complete — no recognized state code, please verify carefully'
+        : 'Nothing legible found — adjust the box or type it in manually';
+      renderThumbs();
     } catch(err){
       console.warn('OCR failed', err);
       statusEl.textContent = 'OCR engine unavailable right now — you can type the plate text in manually';
@@ -673,12 +722,14 @@
   ocrAllBtn.addEventListener('click', async () => {
     if(!images.length) return;
     ocrAllBtn.disabled = true;
-    let done = 0, failed = 0;
+    let done = 0, failed = 0, matched = 0;
     for(const entry of images){
       statusEl.textContent = 'Reading ' + (done + failed + 1) + ' of ' + images.length + '…';
       try{
-        const text = await readPlateText(entry);
-        entry.plateText = text || '(no text found)';
+        const result = await readPlateText(entry);
+        entry.plateText = result.text || '(no text found)';
+        entry.plateMatched = result.matched;
+        if(result.matched) matched++;
         done++;
       } catch(err){
         console.warn('OCR failed for', entry.name, err);
@@ -688,11 +739,12 @@
       }
     }
     if(images[currentIndex]) plateTextInput.value = images[currentIndex].plateText || '';
+    if(images[currentIndex]) updatePlateMatchBadge(images[currentIndex]);
     renderThumbs();
     ocrAllBtn.disabled = false;
     statusEl.textContent = failed
-      ? ('Read ' + done + ' image' + (done===1?'':'s') + (failed ? ', ' + failed + ' failed — OCR may be unavailable, type those in manually' : ''))
-      : ('Read ' + done + ' image' + (done===1?'':'s') + ' — please verify the results');
+      ? ('Read ' + done + ' image' + (done===1?'':'s') + ', ' + matched + ' matched a state code' + (failed ? ', ' + failed + ' failed — OCR may be unavailable' : ''))
+      : ('Read ' + done + ' image' + (done===1?'':'s') + ', ' + matched + ' matched a known state code — please verify the rest');
   });
 
   exportCsvBtn.addEventListener('click', () => {
