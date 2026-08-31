@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <title>Plate Redactor</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
   :root{
     --ink:#1a1d1a;
@@ -599,20 +598,54 @@
   });
 
   // ---------- OCR: best-effort plate text reading ----------
-  // Uses Tesseract.js loaded from a CDN. This is a convenience feature only —
-  // it never blocks or affects the actual redaction/download flow, and if the
-  // OCR engine can't load (e.g. no internet, or blocked in some preview
-  // environments) everything else keeps working; you can still type the
-  // plate text in manually.
+  // Uses Tesseract.js. This is a convenience feature only — it never blocks
+  // or affects the actual redaction/download flow, and if the OCR engine
+  // can't load, everything else keeps working; you can still type the plate
+  // text in manually.
+  //
+  // The library is fetched as text and executed manually (rather than via a
+  // <script src> tag) so a server serving it with an unexpected Content-Type
+  // header still works — some static hosts don't set a clean
+  // text/javascript type for nested paths, which silently stops a normal
+  // <script> tag from executing even though the file itself loads fine.
+
+  const TESSERACT_LIB_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+
+  let tesseractLibPromise = null;
+  function loadTesseractLib(){
+    if(typeof Tesseract !== 'undefined') return Promise.resolve();
+    if(!tesseractLibPromise){
+      tesseractLibPromise = fetch(TESSERACT_LIB_URL)
+        .then(resp => {
+          if(!resp.ok) throw new Error('OCR library fetch failed: HTTP ' + resp.status + ' for ' + TESSERACT_LIB_URL);
+          return resp.text();
+        })
+        .then(code => {
+          const script = document.createElement('script');
+          script.textContent = code;
+          document.head.appendChild(script);
+          if(typeof Tesseract === 'undefined'){
+            throw new Error('OCR library loaded but did not define the expected Tesseract global');
+          }
+        });
+    }
+    return tesseractLibPromise;
+  }
 
   let ocrWorkerPromise = null;
   function getOcrWorker(){
     if(!ocrWorkerPromise){
       ocrWorkerPromise = (async () => {
-        if(typeof Tesseract === 'undefined') throw new Error('OCR library did not load');
-        const worker = await Tesseract.createWorker('eng');
+        await loadTesseractLib();
+        const worker = await Tesseract.createWorker('eng', 1, {});
         try{
-          await worker.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' });
+          await worker.setParameters({
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+            // PSM 7 = "treat the image as a single line of text". Without this,
+            // Tesseract assumes a full page/paragraph layout, which badly
+            // mis-segments a tight single-line plate crop and produces garbage.
+            tessedit_pageseg_mode: '7'
+          });
         } catch(e){ /* older/newer API differences — safe to ignore */ }
         return worker;
       })();
@@ -629,27 +662,75 @@
     const h = Math.round(b.hPct * entry.naturalH);
     if(w < 4 || h < 4) return null;
 
-    // Upscale small crops and boost contrast a little — helps OCR on
-    // low-resolution plate regions.
-    const targetH = 90;
+    // Upscale small crops — OCR needs real pixel height to work with.
+    const targetH = 140;
     const scale = Math.max(1, targetH / h);
-    const outW = Math.max(1, Math.round(w * scale));
-    const outH = Math.max(1, Math.round(h * scale));
+    const cropW = Math.max(1, Math.round(w * scale));
+    const cropH = Math.max(1, Math.round(h * scale));
 
+    const c0 = document.createElement('canvas');
+    c0.width = cropW; c0.height = cropH;
+    const cx0 = c0.getContext('2d');
+    cx0.imageSmoothingEnabled = true;
+    cx0.drawImage(entry.img, x, y, w, h, 0, 0, cropW, cropH);
+
+    const imgData = cx0.getImageData(0, 0, cropW, cropH);
+    const d = imgData.data;
+    const n = cropW * cropH;
+    const gray = new Uint8ClampedArray(n);
+    const hist = new Array(256).fill(0);
+    for(let i=0, p=0; i<d.length; i+=4, p++){
+      const g = Math.round(0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]);
+      gray[p] = g;
+      hist[g]++;
+    }
+
+    // Otsu's method: pick the threshold that best separates the plate
+    // background from the character strokes — works far better for OCR
+    // than a flat contrast boost.
+    let sum = 0;
+    for(let t=0; t<256; t++) sum += t * hist[t];
+    let sumB = 0, wB = 0, wF = 0, maxVar = 0, threshold = 128;
+    for(let t=0; t<256; t++){
+      wB += hist[t];
+      if(wB === 0) continue;
+      wF = n - wB;
+      if(wF === 0) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB;
+      const mF = (sum - sumB) / wF;
+      const between = wB * wF * (mB - mF) * (mB - mF);
+      if(between > maxVar){ maxVar = between; threshold = t; }
+    }
+
+    // Binarize to pure black/white. Assume dark text on a lighter background
+    // (true for the large majority of plates); if the crop is mostly dark
+    // (background darker than midtone), flip so text still ends up black.
+    let brightPixels = 0;
+    for(let p=0; p<n; p++) if(gray[p] >= threshold) brightPixels++;
+    const backgroundIsBright = brightPixels >= n/2;
+
+    // Add a small white margin — Tesseract reads edge-touching text poorly.
+    const pad = Math.round(cropH * 0.15);
+    const outW = cropW + pad*2, outH = cropH + pad*2;
     const c = document.createElement('canvas');
     c.width = outW; c.height = outH;
     const cx = c.getContext('2d');
-    cx.imageSmoothingEnabled = true;
-    cx.drawImage(entry.img, x, y, w, h, 0, 0, outW, outH);
-
-    const imgData = cx.getImageData(0, 0, outW, outH);
-    const d = imgData.data;
-    for(let i=0; i<d.length; i+=4){
-      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-      const boosted = clamp((gray - 128) * 1.4 + 128, 0, 255);
-      d[i] = d[i+1] = d[i+2] = boosted;
+    cx.fillStyle = '#fff';
+    cx.fillRect(0, 0, outW, outH);
+    const outData = cx.getImageData(0, 0, outW, outH);
+    const od = outData.data;
+    for(let py=0; py<cropH; py++){
+      for(let px=0; px<cropW; px++){
+        const p = py*cropW + px;
+        const isTextPixel = backgroundIsBright ? gray[p] < threshold : gray[p] >= threshold;
+        const val = isTextPixel ? 0 : 255;
+        const oi = ((py+pad)*outW + (px+pad)) * 4;
+        od[oi] = od[oi+1] = od[oi+2] = val;
+        od[oi+3] = 255;
+      }
     }
-    cx.putImageData(imgData, 0, 0);
+    cx.putImageData(outData, 0, 0);
     return c;
   }
 
@@ -667,15 +748,36 @@
     'AP','AS','BR','CH','CG','DN','DL','GA','GJ','HR','HP','JK','JH','KA',
     'KL','MP','MH','MN','OR','PY','PB','TR','TN','RJ','TS','UP','UK','WB'
   ];
-  const STATE_CODE_RE = new RegExp('(' + INDIAN_STATE_CODES.join('|') + ')[A-Z0-9]{4,10}');
+
+  // OCR very commonly confuses these digit/letter look-alikes. When hunting
+  // for a state code (which is always two letters), normalize digits to
+  // their letter look-alike before comparing — this alone fixes a lot of
+  // "0L" / "8R" / "5J" style misreads without touching the displayed text.
+  const OCR_DIGIT_TO_LETTER = { '0':'O', '1':'I', '5':'S', '8':'B', '2':'Z', '6':'G', '4':'A', '7':'T' };
 
   // Looks for <state code><RTO digits><series letters><number> inside the
   // raw OCR text (spaces removed, since OCR often splits/merges groups).
-  // Returns the matched plate string, or null if no known state code is found.
+  // Normalizes digit/letter look-alikes (the single most common OCR mistake
+  // on a 2-letter state code) before matching, and requires a plausible
+  // trailing digit run so random text doesn't get mistaken for a plate.
+  // Returns the matched plate string (original, uncorrected characters), or
+  // null if nothing plausible is found.
   function extractIndianPlate(rawText){
     const compact = cleanPlateText(rawText).replace(/\s+/g, '');
-    const match = compact.match(STATE_CODE_RE);
-    return match ? match[0] : null;
+    if(compact.length < 6) return null;
+
+    const normalized = compact.split('').map(ch => OCR_DIGIT_TO_LETTER[ch] || ch).join('');
+
+    for(let i=0; i<=normalized.length-2; i++){
+      if(!INDIAN_STATE_CODES.includes(normalized.substr(i,2))) continue;
+      const candidate = compact.substr(i, Math.min(10, compact.length - i));
+      if(candidate.length < 6) continue;
+      const rest = candidate.slice(2);
+      if(!/\d{3,4}/.test(rest)) continue; // real plates always end in a number run
+      return candidate;
+    }
+
+    return null;
   }
 
   async function readPlateText(entry){
